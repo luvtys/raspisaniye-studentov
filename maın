@@ -1,0 +1,545 @@
+import sqlite3
+import sys
+import os
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QDialog, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QTableWidget,
+    QTableWidgetItem, QMessageBox, QComboBox, QFileDialog, QWidget, QFormLayout, QListWidget
+)
+from PyQt5.QtCore import Qt
+from openpyxl import Workbook
+
+# Подключение к базе данных
+DB_PATH = "schedule.db"
+
+def connect_db():
+    # Проверяем, существует ли файл базы данных
+    db_exists = os.path.exists(DB_PATH)
+
+    # Создаем соединение
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Создаем таблицы, если они не существуют
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS teachers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL
+    );
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS rooms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        capacity INTEGER
+    );
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL
+    );
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL
+    );
+    """)
+
+    # Проверяем, существует ли таблица schedule
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS schedule (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject_id INTEGER,
+        time TEXT,
+        teacher_id INTEGER,
+        room_id INTEGER,
+        day_of_week TEXT,
+        FOREIGN KEY (subject_id) REFERENCES subjects(id),
+        FOREIGN KEY (teacher_id) REFERENCES teachers(id),
+        FOREIGN KEY (room_id) REFERENCES rooms(id)
+    );
+    """)
+
+    # Проверяем, существуют ли все необходимые столбцы в таблице schedule
+    cursor.execute("PRAGMA table_info(schedule)")
+    columns = cursor.fetchall()
+    column_names = [column[1] for column in columns]
+
+    required_columns = ["id", "subject_id", "time", "teacher_id", "room_id", "day_of_week"]
+    for column in required_columns:
+        if column not in column_names:
+            # Если какой-то столбец отсутствует, пересоздаем таблицу
+            cursor.execute("DROP TABLE IF EXISTS schedule")
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schedule (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id INTEGER,
+                time TEXT,
+                teacher_id INTEGER,
+                room_id INTEGER,
+                day_of_week TEXT,
+                FOREIGN KEY (subject_id) REFERENCES subjects(id),
+                FOREIGN KEY (teacher_id) REFERENCES teachers(id),
+                FOREIGN KEY (room_id) REFERENCES rooms(id)
+            );
+            """)
+            break
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS schedule_groups (
+        schedule_id INTEGER,
+        group_id INTEGER,
+        FOREIGN KEY (schedule_id) REFERENCES schedule(id),
+        FOREIGN KEY (group_id) REFERENCES groups(id)
+    );
+    """)
+
+    # Если база данных только что создана, добавляем тестовые данные
+    if not db_exists:
+        # Добавление преподавателей
+        cursor.execute("INSERT INTO teachers (name) VALUES ('Иванов И.И.');")
+        cursor.execute("INSERT INTO teachers (name) VALUES ('Петров П.П.');")
+
+        # Добавление аудиторий
+        cursor.execute("INSERT INTO rooms (name, capacity) VALUES ('Аудитория 101', 30);")
+        cursor.execute("INSERT INTO rooms (name, capacity) VALUES ('Аудитория 202', 50);")
+
+        # Добавление предметов
+        cursor.execute("INSERT INTO subjects (name) VALUES ('Математика');")
+        cursor.execute("INSERT INTO subjects (name) VALUES ('Физика');")
+
+        # Добавление групп студентов
+        cursor.execute("INSERT INTO groups (name) VALUES ('Группа 1');")
+        cursor.execute("INSERT INTO groups (name) VALUES ('Группа 2');")
+
+        # Добавление записей в расписание
+        cursor.execute("INSERT INTO schedule (subject_id, time, teacher_id, room_id, day_of_week) VALUES (1, '10:00', 1, 1, 'Понедельник');")
+        cursor.execute("INSERT INTO schedule (subject_id, time, teacher_id, room_id, day_of_week) VALUES (2, '12:00', 2, 2, 'Вторник');")
+
+        # Связь занятий с группами
+        cursor.execute("INSERT INTO schedule_groups (schedule_id, group_id) VALUES (1, 1);")
+        cursor.execute("INSERT INTO schedule_groups (schedule_id, group_id) VALUES (2, 2);")
+
+        conn.commit()
+
+    return conn
+
+# Окно авторизации
+class LoginDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Авторизация")
+        self.setGeometry(600, 300, 300, 200)
+
+        self.user_type = None
+
+        # Элементы интерфейса
+        self.label_username = QLabel("Логин:")
+        self.input_username = QLineEdit()
+        self.label_password = QLabel("Пароль:")
+        self.input_password = QLineEdit()
+        self.input_password.setEchoMode(QLineEdit.Password)
+        self.btn_login = QPushButton("Войти")
+
+        self.btn_login.clicked.connect(self.login)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.label_username)
+        layout.addWidget(self.input_username)
+        layout.addWidget(self.label_password)
+        layout.addWidget(self.input_password)
+        layout.addWidget(self.btn_login)
+        self.setLayout(layout)
+
+    def login(self):
+        username = self.input_username.text()
+        password = self.input_password.text()
+
+        # Простая проверка логина и пароля
+        if username == "admin" and password == "admin123":
+            self.user_type = "Администратор"
+            self.accept()
+        elif username == "user" and password == "user123":
+            self.user_type = "Пользователь"
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Ошибка", "Неверный логин или пароль")
+
+# Окно управления данными (преподаватели, предметы, аудитории, группы)
+class ManageDialog(QDialog):
+    def __init__(self, conn):
+        super().__init__()
+        self.conn = conn
+        self.setWindowTitle("Управление данными")
+        self.setGeometry(500, 300, 400, 300)
+
+        self.init_ui()
+
+    def init_ui(self):
+        # Выбор таблицы для управления
+        self.combo_table = QComboBox()
+        self.combo_table.addItem("Преподаватели", "teachers")
+        self.combo_table.addItem("Предметы", "subjects")
+        self.combo_table.addItem("Аудитории", "rooms")
+        self.combo_table.addItem("Группы", "groups")
+        self.combo_table.currentIndexChanged.connect(self.load_data)
+
+        # Список данных
+        self.list_widget = QListWidget(self)
+
+        # Поля для ввода данных
+        self.input_name = QLineEdit()
+        self.input_capacity = QLineEdit()  # Для аудиторий
+        self.input_capacity.setVisible(False)  # По умолчанию скрыто
+
+        # Кнопки
+        self.btn_add = QPushButton("Добавить")
+        self.btn_delete = QPushButton("Удалить")
+
+        self.btn_add.clicked.connect(self.add_item)
+        self.btn_delete.clicked.connect(self.delete_item)
+
+        # Основной макет
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Выберите таблицу:"))
+        layout.addWidget(self.combo_table)
+        layout.addWidget(self.list_widget)
+        layout.addWidget(QLabel("Название:"))
+        layout.addWidget(self.input_name)
+        layout.addWidget(QLabel("Вместимость (для аудиторий):"))
+        layout.addWidget(self.input_capacity)
+        layout.addWidget(self.btn_add)
+        layout.addWidget(self.btn_delete)
+        self.setLayout(layout)
+
+        # Загрузка данных при старте
+        self.load_data()
+
+    def load_data(self):
+        self.list_widget.clear()
+        table_name = self.combo_table.currentData()
+
+        cursor = self.conn.cursor()
+        if table_name == "rooms":
+            cursor.execute(f"SELECT id, name, capacity FROM {table_name}")
+            rows = cursor.fetchall()
+            for row in rows:
+                self.list_widget.addItem(f"{row[0]}: {row[1]} (Вместимость: {row[2]})")
+        else:
+            cursor.execute(f"SELECT id, name FROM {table_name}")
+            rows = cursor.fetchall()
+            for row in rows:
+                self.list_widget.addItem(f"{row[0]}: {row[1]}")
+
+        # Показываем поле "Вместимость" только для аудиторий
+        self.input_capacity.setVisible(table_name == "rooms")
+
+    def add_item(self):
+        table_name = self.combo_table.currentData()
+        name = self.input_name.text()
+
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите название.")
+            return
+
+        cursor = self.conn.cursor()
+        if table_name == "rooms":
+            capacity = self.input_capacity.text()
+            if not capacity.isdigit():
+                QMessageBox.warning(self, "Ошибка", "Введите корректную вместимость.")
+                return
+            cursor.execute(f"INSERT INTO {table_name} (name, capacity) VALUES (?, ?)", (name, int(capacity)))
+        else:
+            cursor.execute(f"INSERT INTO {table_name} (name) VALUES (?)", (name,))
+
+        self.conn.commit()
+        self.load_data()
+        self.input_name.clear()
+        self.input_capacity.clear()
+
+    def delete_item(self):
+        selected_item = self.list_widget.currentItem()
+        if not selected_item:
+            QMessageBox.warning(self, "Ошибка", "Выберите запись для удаления.")
+            return
+
+        item_id = selected_item.text().split(":")[0]
+        table_name = self.combo_table.currentData()
+
+        cursor = self.conn.cursor()
+        cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (item_id,))
+        self.conn.commit()
+        self.load_data()
+
+# Окно для добавления/редактирования записей в расписании
+class EditScheduleDialog(QDialog):
+    def __init__(self, conn, record=None):
+        super().__init__()
+        self.conn = conn
+        self.record = record
+        self.setWindowTitle("Редактирование записи" if record else "Добавление записи")
+        self.setGeometry(500, 300, 400, 400)  # Увеличиваем высоту окна
+
+        self.init_ui()
+
+    def init_ui(self):
+        self.combo_subject = QComboBox()
+        self.combo_teacher = QComboBox()
+        self.combo_room = QComboBox()
+        self.input_time = QLineEdit()
+
+        # Добавляем выпадающий список для групп
+        self.combo_group = QComboBox()
+
+        # Добавляем выпадающий список для дня недели
+        self.combo_day_of_week = QComboBox()
+        self.combo_day_of_week.addItems(["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"])
+
+        self.load_combobox_data()
+
+        if self.record:
+            self.input_time.setText(self.record[2])
+            self.combo_day_of_week.setCurrentText(self.record[5] if self.record[5] else "Понедельник")
+
+        self.btn_save = QPushButton("Сохранить")
+        self.btn_save.clicked.connect(self.save_record)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Предмет:"))
+        layout.addWidget(self.combo_subject)
+        layout.addWidget(QLabel("Преподаватель:"))
+        layout.addWidget(self.combo_teacher)
+        layout.addWidget(QLabel("Аудитория:"))
+        layout.addWidget(self.combo_room)
+        layout.addWidget(QLabel("Время:"))
+        layout.addWidget(self.input_time)
+        layout.addWidget(QLabel("Группа:"))
+        layout.addWidget(self.combo_group)
+        layout.addWidget(QLabel("День недели:"))  # Добавляем метку для дня недели
+        layout.addWidget(self.combo_day_of_week)  # Добавляем выпадающий список
+        layout.addWidget(self.btn_save)
+        self.setLayout(layout)
+
+    def load_combobox_data(self):
+        cursor = self.conn.cursor()
+
+        # Загрузка предметов
+        cursor.execute("SELECT id, name FROM subjects")
+        subjects = cursor.fetchall()
+        for subject in subjects:
+            self.combo_subject.addItem(subject[1], subject[0])
+
+        # Загрузка преподавателей
+        cursor.execute("SELECT id, name FROM teachers")
+        teachers = cursor.fetchall()
+        for teacher in teachers:
+            self.combo_teacher.addItem(teacher[1], teacher[0])
+
+        # Загрузка аудиторий
+        cursor.execute("SELECT id, name FROM rooms")
+        rooms = cursor.fetchall()
+        for room in rooms:
+            self.combo_room.addItem(room[1], room[0])
+
+        # Загрузка групп
+        cursor.execute("SELECT id, name FROM groups")
+        groups = cursor.fetchall()
+        for group in groups:
+            self.combo_group.addItem(group[1], group[0])  # Добавляем группы в выпадающий список
+
+    def save_record(self):
+        subject_id = self.combo_subject.currentData()
+        teacher_id = self.combo_teacher.currentData()
+        room_id = self.combo_room.currentData()
+        time = self.input_time.text()
+        group_id = self.combo_group.currentData()
+        day_of_week = self.combo_day_of_week.currentText()  # Получаем выбранный день недели
+
+        cursor = self.conn.cursor()
+        if self.record:
+            # Обновление записи в расписании
+            cursor.execute(
+                "UPDATE schedule SET subject_id = ?, time = ?, teacher_id = ?, room_id = ?, day_of_week = ? WHERE id = ?",
+                (subject_id, time, teacher_id, room_id, day_of_week, self.record[0])
+            )
+            schedule_id = self.record[0]
+        else:
+            # Добавление новой записи в расписание
+            cursor.execute(
+                "INSERT INTO schedule (subject_id, time, teacher_id, room_id, day_of_week) VALUES (?, ?, ?, ?, ?)",
+                (subject_id, time, teacher_id, room_id, day_of_week)
+            )
+            schedule_id = cursor.lastrowid
+
+        # Удаляем старые связи с группами (если редактируем запись)
+        cursor.execute("DELETE FROM schedule_groups WHERE schedule_id = ?", (schedule_id,))
+
+        # Добавляем связь с выбранной группой
+        cursor.execute("INSERT INTO schedule_groups (schedule_id, group_id) VALUES (?, ?)", (schedule_id, group_id))
+
+        self.conn.commit()
+        self.accept()
+
+# Главное окно
+class MainWindow(QMainWindow):
+    def __init__(self, user_type):
+        super().__init__()
+        self.user_type = user_type
+        self.setWindowTitle("Расписание занятий студентов")
+        self.setGeometry(400, 200, 800, 600)
+
+        self.conn = connect_db()
+        self.init_ui()
+
+    def init_ui(self):
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(7)  # Добавляем столбец для дня недели
+        self.table.setHorizontalHeaderLabels(["ID", "Предмет", "Время", "Преподаватель", "Аудитория", "Группа", "День недели"])
+        self.load_data()
+
+        # Кнопки
+        self.btn_export = QPushButton("Экспорт в Excel")
+        self.btn_export.clicked.connect(self.export_to_excel)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.btn_export)
+
+        if self.user_type == "Администратор":
+            self.btn_add = QPushButton("Добавить запись")
+            self.btn_edit = QPushButton("Редактировать запись")
+            self.btn_delete = QPushButton("Удалить запись")
+            self.btn_manage = QPushButton("Управление данными")
+
+            self.btn_add.clicked.connect(self.add_record)
+            self.btn_edit.clicked.connect(self.edit_record)
+            self.btn_delete.clicked.connect(self.delete_record)
+            self.btn_manage.clicked.connect(self.manage_data)
+
+            button_layout.addWidget(self.btn_add)
+            button_layout.addWidget(self.btn_edit)
+            button_layout.addWidget(self.btn_delete)
+            button_layout.addWidget(self.btn_manage)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.table)
+        layout.addLayout(button_layout)
+
+        central_widget = QWidget()
+        central_widget.setLayout(layout)
+        self.setCentralWidget(central_widget)
+
+    def load_data(self):
+        self.table.setRowCount(0)
+        cursor = self.conn.cursor()
+        cursor.execute("""
+        SELECT schedule.id, subjects.name, schedule.time, teachers.name, rooms.name, groups.name, schedule.day_of_week
+        FROM schedule
+        JOIN subjects ON schedule.subject_id = subjects.id
+        JOIN teachers ON schedule.teacher_id = teachers.id
+        JOIN rooms ON schedule.room_id = rooms.id
+        LEFT JOIN schedule_groups ON schedule.id = schedule_groups.schedule_id
+        LEFT JOIN groups ON schedule_groups.group_id = groups.id
+        """)
+        rows = cursor.fetchall()
+
+        self.table.setRowCount(len(rows))
+        for row_idx, row_data in enumerate(rows):
+            for col_idx, col_data in enumerate(row_data):
+                self.table.setItem(row_idx, col_idx, QTableWidgetItem(str(col_data) if col_data else ""))
+
+        self.table.resizeColumnsToContents()  # Автоширина столбцов
+
+    def add_record(self):
+        self.edit_dialog = EditScheduleDialog(self.conn)
+        if self.edit_dialog.exec_():
+            self.load_data()
+
+    def edit_record(self):
+        selected_row = self.table.currentRow()
+        if selected_row == -1:
+            QMessageBox.warning(self, "Ошибка", "Выберите запись для редактирования.")
+            return
+
+        def get_cell_value(row, column):
+            item = self.table.item(row, column)
+            return item.text() if item else ""
+
+        record_id = get_cell_value(selected_row, 0)
+        subject = get_cell_value(selected_row, 1)
+        time = get_cell_value(selected_row, 2)
+        teacher = get_cell_value(selected_row, 3)
+        room = get_cell_value(selected_row, 4)
+        day_of_week = get_cell_value(selected_row, 6)
+
+        edit_dialog = EditScheduleDialog(self.conn, record=(record_id, subject, time, teacher, room, day_of_week))
+        if edit_dialog.exec_():
+            self.load_data()
+
+    def delete_record(self):
+        selected_row = self.table.currentRow()
+        if selected_row == -1:
+            QMessageBox.warning(self, "Ошибка", "Выберите запись для удаления.")
+            return
+
+        record_id = self.table.item(selected_row, 0).text()
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM schedule WHERE id = ?", (record_id,))
+        self.conn.commit()
+        self.load_data()
+
+    def manage_data(self):
+        self.manage_dialog = ManageDialog(self.conn)
+        self.manage_dialog.exec_()
+
+    def export_to_excel(self):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+        SELECT schedule.id, subjects.name, schedule.time, teachers.name, rooms.name, groups.name, schedule.day_of_week
+        FROM schedule
+        JOIN subjects ON schedule.subject_id = subjects.id
+        JOIN teachers ON schedule.teacher_id = teachers.id
+        JOIN rooms ON schedule.room_id = rooms.id
+        LEFT JOIN schedule_groups ON schedule.id = schedule_groups.schedule_id
+        LEFT JOIN groups ON schedule_groups.group_id = groups.id
+        """)
+        rows = cursor.fetchall()
+
+        if not rows:
+            QMessageBox.warning(self, "Ошибка", "Нет данных для экспорта.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить файл", "", "Excel Files (*.xlsx)")
+        if not path:
+            return
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Расписание"
+
+        headers = ["ID", "Предмет", "Время", "Преподаватель", "Аудитория", "Группа", "День недели"]
+        ws.append(headers)
+
+        for row in rows:
+            ws.append(row)
+
+        for col in ws.columns:
+            max_length = max(len(str(cell.value)) for cell in col) + 2
+            ws.column_dimensions[col[0].column_letter].width = max_length
+
+        try:
+            wb.save(path)
+            QMessageBox.information(self, "Успех", f"Файл успешно сохранён: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл: {e}")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    login = LoginDialog()
+    if login.exec_():
+        window = MainWindow(login.user_type)
+        window.show()
+        sys.exit(app.exec_())
